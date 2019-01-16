@@ -4,7 +4,8 @@
 
 #define RDMA_READ_SIZE 8
 #define RDMA_WRITE_SIZE 4096
-#define RDMA_WRITE_NUM (2 + 4)
+#define RDMA_WRITE_IN_SEQ 4
+#define RDMA_WRITE_NUM (RDMA_WRITE_IN_SEQ * 3)
 
 static const int RDMA_BUFFER_SIZE = RDMA_WRITE_SIZE * RDMA_WRITE_NUM + RDMA_READ_SIZE;
 
@@ -70,8 +71,9 @@ struct connection {
 
   enum {
     TS_INIT,
-    TS_WRITEx2N_READ = TS_INIT,
-    TS_WRITEx4N_READ,
+    TS_WRITE_READ_1SEQ = TS_INIT,
+    TS_WRITE_READ_2SEQ,
+    TS_WRITE_READ_3SEQ,
     TS_DONE,
 
     TS_SERVER_INIT,
@@ -278,18 +280,15 @@ void on_completion(struct ibv_wc *wc)
 
   /* sides exchanged memory regions - we are ready to perform RMA */
   if (conn->send_state == SS_MR_SENT && conn->recv_state == RS_MR_RECV) {
+    int i = 0;
     switch(conn->test_state) {
-    case TS_WRITEx2N_READ:
+    case TS_WRITE_READ_1SEQ:
       printf("Test sequenct start...\n");
-      send_write(conn, 0);
-      send_write(conn, 1);
-      send_read(conn);
-      break;
-    case TS_WRITEx4N_READ:
-      send_write(conn, 2);
-      send_write(conn, 3);
-      send_write(conn, 4);
-      send_write(conn, 5);
+    case TS_WRITE_READ_2SEQ:
+    case TS_WRITE_READ_3SEQ:
+      for (i = 0; i < RDMA_WRITE_IN_SEQ; ++i) {
+        send_write(conn, i + (int)conn->test_state * RDMA_WRITE_IN_SEQ);
+      }
       send_read(conn);
       break;
     case TS_DONE:

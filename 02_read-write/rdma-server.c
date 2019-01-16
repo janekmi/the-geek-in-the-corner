@@ -57,7 +57,7 @@ int on_connect_request(struct rdma_cm_id *id)
   struct rdma_conn_param cm_params;
 
   printf("received connection request.\n");
-  build_connection(id);
+  build_connection(id, 0 /* is NOT client */);
   build_params(&cm_params);
   sprintf(get_local_message_region(id->context), "message from passive/server side with pid %d", getpid());
   TEST_NZ(rdma_accept(id, &cm_params));

@@ -1,6 +1,21 @@
+#include <assert.h>
+
 #include "rdma-common.h"
 
-static const int RDMA_BUFFER_SIZE = 1024;
+#define RDMA_READ_SIZE 8
+#define RDMA_WRITE_SIZE 4096
+#define RDMA_WRITE_NUM (2 + 4)
+
+static const int RDMA_BUFFER_SIZE = RDMA_WRITE_SIZE * RDMA_WRITE_NUM + RDMA_READ_SIZE;
+
+#define RDMA_WRITE_OFFSET(i) \
+	RDMA_WRITE_SIZE * (i)
+#define RDMA_READ_OFFSET \
+	RDMA_BUFFER_SIZE - RDMA_READ_SIZE
+
+#define NO_FLAGS (0)
+#define RDMA_SGE_LIMIT (RDMA_WRITE_NUM * 2) /* big enough to handle all ops */
+#define RDMA_RW_ACCESS (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ)
 
 struct message {
   enum {
@@ -44,7 +59,6 @@ struct connection {
   enum {
     SS_INIT,
     SS_MR_SENT,
-    SS_RDMA_SENT,
     SS_DONE_SENT
   } send_state;
 
@@ -53,6 +67,17 @@ struct connection {
     RS_MR_RECV,
     RS_DONE_RECV
   } recv_state;
+
+  enum {
+    TS_INIT,
+    TS_WRITEx2N_READ = TS_INIT,
+    TS_WRITEx4N_READ,
+    TS_DONE,
+
+    TS_SERVER_INIT,
+    TS_SERVER_WAIT = TS_SERVER_INIT,
+    TS_SERVER_DONE
+  } test_state;
 };
 
 static void build_context(struct ibv_context *verbs);
@@ -73,7 +98,7 @@ void die(const char *reason)
   exit(EXIT_FAILURE);
 }
 
-void build_connection(struct rdma_cm_id *id)
+void build_connection(struct rdma_cm_id *id, int is_client)
 {
   struct connection *conn;
   struct ibv_qp_init_attr qp_attr;
@@ -90,6 +115,7 @@ void build_connection(struct rdma_cm_id *id)
 
   conn->send_state = SS_INIT;
   conn->recv_state = RS_INIT;
+  conn->test_state = is_client ? TS_INIT : TS_SERVER_INIT;
 
   conn->connected = 0;
 
@@ -136,8 +162,8 @@ void build_qp_attr(struct ibv_qp_init_attr *qp_attr)
 
   qp_attr->cap.max_send_wr = 10;
   qp_attr->cap.max_recv_wr = 10;
-  qp_attr->cap.max_send_sge = 1;
-  qp_attr->cap.max_recv_sge = 1;
+  qp_attr->cap.max_send_sge = RDMA_SGE_LIMIT;
+  qp_attr->cap.max_recv_sge = RDMA_SGE_LIMIT;
 }
 
 void destroy_connection(void *context)
@@ -177,6 +203,43 @@ char * get_peer_message_region(struct connection *conn)
     return conn->rdma_local_region;
 }
 
+void send_common(struct connection *conn,
+		enum ibv_wr_opcode opcode, unsigned int flags,
+		uintptr_t off, uint32_t length)
+{
+    struct ibv_send_wr wr, *bad_wr = NULL;
+    struct ibv_sge sge;
+
+    memset(&wr, 0, sizeof(wr));
+
+    wr.wr_id = (uintptr_t)conn;
+    wr.opcode = opcode;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.send_flags = flags;
+    wr.wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr + off;
+    wr.wr.rdma.rkey = conn->peer_mr.rkey;
+
+    sge.addr = (uintptr_t)conn->rdma_local_region + off;
+    sge.length = length;
+    sge.lkey = conn->rdma_local_mr->lkey;
+
+    TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
+}
+
+void send_write(struct connection *conn, unsigned opid)
+{
+    assert(opid < RDMA_WRITE_NUM);
+    send_common(conn, IBV_WR_RDMA_WRITE, NO_FLAGS, RDMA_WRITE_OFFSET(opid),
+		RDMA_WRITE_SIZE);
+}
+
+void send_read(struct connection *conn)
+{
+    send_common(conn, IBV_WR_RDMA_READ, IBV_SEND_SIGNALED, RDMA_READ_OFFSET,
+		RDMA_READ_SIZE);
+}
+
 void on_completion(struct ibv_wc *wc)
 {
   struct connection *conn = (struct connection *)(uintptr_t)wc->wr_id;
@@ -185,6 +248,7 @@ void on_completion(struct ibv_wc *wc)
     die("on_completion: status is not IBV_WC_SUCCESS.");
 
   if (wc->opcode & IBV_WC_RECV) {
+    /* process IBV_WC_RECV */
     conn->recv_state++;
 
     if (conn->recv_msg->type == MSG_MR) {
@@ -193,42 +257,53 @@ void on_completion(struct ibv_wc *wc)
 
       if (conn->send_state == SS_INIT) /* received peer's MR before sending ours, so send ours back */
         send_mr(conn);
+    } else if (conn->recv_state == RS_DONE_RECV) {
+      if (conn->test_state == TS_SERVER_WAIT) {
+        /* client sent done message */
+        printf("Test done.\n");
+        conn->send_msg->type = MSG_DONE;
+        send_message(conn);
+      }
     }
-
-  } else {
+  } else if (wc->opcode == IBV_WC_SEND) {
+    /* process IBV_WC_SEND */
     conn->send_state++;
     printf("send completed successfully.\n");
+  } else if (wc->opcode == IBV_WC_RDMA_READ) {
+    /* process IBV_WC_RDMA_READ */
+    conn->test_state++;
+  } else {
+    assert(0);
   }
 
+  /* sides exchanged memory regions - we are ready to perform RMA */
   if (conn->send_state == SS_MR_SENT && conn->recv_state == RS_MR_RECV) {
-    struct ibv_send_wr wr, *bad_wr = NULL;
-    struct ibv_sge sge;
-
-    if (s_mode == M_WRITE)
-      printf("received MSG_MR. writing message to remote memory...\n");
-    else
-      printf("received MSG_MR. reading message from remote memory...\n");
-
-    memset(&wr, 0, sizeof(wr));
-
-    wr.wr_id = (uintptr_t)conn;
-    wr.opcode = (s_mode == M_WRITE) ? IBV_WR_RDMA_WRITE : IBV_WR_RDMA_READ;
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.send_flags = IBV_SEND_SIGNALED;
-    wr.wr.rdma.remote_addr = (uintptr_t)conn->peer_mr.addr;
-    wr.wr.rdma.rkey = conn->peer_mr.rkey;
-
-    sge.addr = (uintptr_t)conn->rdma_local_region;
-    sge.length = RDMA_BUFFER_SIZE;
-    sge.lkey = conn->rdma_local_mr->lkey;
-
-    TEST_NZ(ibv_post_send(conn->qp, &wr, &bad_wr));
-
-    conn->send_msg->type = MSG_DONE;
-    send_message(conn);
-
+    switch(conn->test_state) {
+    case TS_WRITEx2N_READ:
+      printf("Test sequenct start...\n");
+      send_write(conn, 0);
+      send_write(conn, 1);
+      send_read(conn);
+      break;
+    case TS_WRITEx4N_READ:
+      send_write(conn, 2);
+      send_write(conn, 3);
+      send_write(conn, 4);
+      send_write(conn, 5);
+      send_read(conn);
+      break;
+    case TS_DONE:
+      printf("Test sequenct stop.\n");
+      conn->send_msg->type = MSG_DONE;
+      send_message(conn);
+      break;
+    case TS_SERVER_WAIT:
+      break;
+    default:
+      assert(0);
+    }
   } else if (conn->send_state == SS_DONE_SENT && conn->recv_state == RS_DONE_RECV) {
+    /* sides agreed to disconnect */
     printf("remote buffer: %s\n", get_peer_message_region(conn));
     rdma_disconnect(conn->id);
   }
@@ -291,7 +366,7 @@ void register_memory(struct connection *conn)
     s_ctx->pd, 
     conn->recv_msg, 
     sizeof(struct message), 
-    IBV_ACCESS_LOCAL_WRITE | ((s_mode == M_WRITE) ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)));
+    IBV_ACCESS_LOCAL_WRITE | RDMA_RW_ACCESS));
 
   TEST_Z(conn->rdma_local_mr = ibv_reg_mr(
     s_ctx->pd, 
@@ -303,7 +378,7 @@ void register_memory(struct connection *conn)
     s_ctx->pd, 
     conn->rdma_remote_region, 
     RDMA_BUFFER_SIZE, 
-    IBV_ACCESS_LOCAL_WRITE | ((s_mode == M_WRITE) ? IBV_ACCESS_REMOTE_WRITE : IBV_ACCESS_REMOTE_READ)));
+    IBV_ACCESS_LOCAL_WRITE | RDMA_RW_ACCESS));
 }
 
 void send_message(struct connection *conn)
